@@ -50,6 +50,29 @@ systemctl --user daemon-reload
 systemctl --user enable --now mic-indicator
 ```
 
+## NixOS / Home Manager
+
+The flake exposes `nixosModules.default` and `homeManagerModules.default`, so
+there is no need to hand-write the unit:
+
+```nix
+# flake.nix
+inputs.mic-indicator.url = "github:moonkaktus/mic-indicator";
+inputs.mic-indicator.inputs.nixpkgs.follows = "nixpkgs";
+```
+
+```nix
+# NixOS configuration (or use homeManagerModules.default for Home Manager)
+{
+  imports = [ inputs.mic-indicator.nixosModules.default ];
+  programs.mic-indicator.enable = true;
+}
+```
+
+The user service binds to `graphical-session.target`; override the target with
+`programs.mic-indicator.systemdTarget` (e.g. `niri.service`) and the package
+with `programs.mic-indicator.package`.
+
 ## Tweaks
 
 - Position: change the `gtk_layer_set_anchor(...)` calls and/or add margins
