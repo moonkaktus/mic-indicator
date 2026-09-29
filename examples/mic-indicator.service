@@ -1,0 +1,11 @@
+[Unit]
+Description=Microphone activity indicator (GTK4 layer-shell dot)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.nix-profile/bin/mic-indicator
+Restart=on-failure
+
+[Install]
+WantedBy=graphical-session.target
