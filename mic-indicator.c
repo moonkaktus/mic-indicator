@@ -49,9 +49,20 @@ struct node {
 	struct data *d;
 	char *media_class;
 	char *node_name;
-	bool muted;
+	bool muted;         /* Props:mute — unreliable with a hardware mute */
+	uint32_t device_id; /* device.id global, 0 if none */
 	struct pw_node *proxy;
 	struct spa_hook listener;
+};
+
+/* Device route state. On ALSA sources with route.hw-mute the node's
+ * Props:mute stays false; the active input route holds the real mute. */
+struct device {
+	struct data *d;
+	struct pw_device *proxy;
+	struct spa_hook listener;
+	bool input_muted;
+	bool input_mute_known;
 };
 
 struct link {
@@ -69,7 +80,8 @@ struct data {
 	struct spa_hook core_listener, registry_listener, meta_listener;
 	struct spa_source *reconnect_source;
 
-	GHashTable *nodes;  /* global id -> struct node */
+	GHashTable *nodes;    /* global id -> struct node */
+	GHashTable *devices;  /* global id -> struct device */
 	GPtrArray *links;	  /* struct link */
 	char *default_source;
 
@@ -106,7 +118,18 @@ static void recompute(struct data *d)
 			while (g_hash_table_iter_next(&it, NULL, &v)) {
 				struct node *n = v;
 				if (spa_streq(n->node_name, d->default_source)) {
-					if (n->muted)
+					/* Prefer the device's active input route:
+					 * with a hardware mute the node's
+					 * Props:mute stays false. */
+					bool muted = n->muted;
+					if (n->device_id) {
+						struct device *dev = g_hash_table_lookup(
+							d->devices,
+							GUINT_TO_POINTER(n->device_id));
+						if (dev && dev->input_mute_known)
+							muted = dev->input_muted;
+					}
+					if (muted)
 						s = ST_MUTED;
 					break;
 				}
@@ -150,6 +173,9 @@ static void on_node_info(void *_n, const struct pw_node_info *info)
 		g_free(n->node_name);
 		n->node_name = g_strdup(v);
 	}
+	v = spa_dict_lookup(info->props, "device.id");
+	if (v)
+		n->device_id = (uint32_t)strtoul(v, NULL, 10);
 
 	/* Subscribe Props on every Audio/Source, not just the current default —
 	 * otherwise switching defaults leaves the new source's mute unknown. */
@@ -181,6 +207,53 @@ static const struct pw_node_events node_events = {
 	PW_VERSION_NODE_EVENTS,
 	.info = on_node_info,
 	.param = on_node_param,
+};
+
+/* ── device events ── */
+
+static void on_device_info(void *_dev, const struct pw_device_info *info)
+{
+	struct device *dev = _dev;
+	if (!g_hash_table_contains(dev->d->devices, GUINT_TO_POINTER(info->id)))
+		return; /* global already removed */
+	uint32_t params[1] = { SPA_PARAM_Route };
+	pw_device_subscribe_params(dev->proxy, params, 1);
+}
+
+static void on_device_param(void *_dev, int seq, uint32_t id, uint32_t index,
+			    uint32_t next, const struct spa_pod *param)
+{
+	struct device *dev = _dev;
+	(void)seq;
+	(void)index;
+	(void)next;
+	if (!param || id != SPA_PARAM_Route)
+		return;
+
+	/* Only the active route per direction is reported; pick the input one
+	 * and read its nested Props:mute. */
+	const struct spa_pod_prop *p =
+		spa_pod_find_prop(param, NULL, SPA_PARAM_ROUTE_direction);
+	uint32_t direction;
+	if (!p || spa_pod_get_id(&p->value, &direction) < 0 ||
+	    direction != SPA_DIRECTION_INPUT)
+		return;
+	p = spa_pod_find_prop(param, NULL, SPA_PARAM_ROUTE_props);
+	if (!p)
+		return;
+	const struct spa_pod_prop *m =
+		spa_pod_find_prop(&p->value, NULL, SPA_PROP_mute);
+	if (!m)
+		return;
+	spa_pod_get_bool(&m->value, &dev->input_muted);
+	dev->input_mute_known = true;
+	recompute(dev->d);
+}
+
+static const struct pw_device_events device_events = {
+	PW_VERSION_DEVICE_EVENTS,
+	.info = on_device_info,
+	.param = on_device_param,
 };
 
 /* ── link events ── */
@@ -260,8 +333,19 @@ static void on_global(void *_d, uint32_t id, uint32_t permissions,
 		struct node *n = g_new0(struct node, 1);
 		n->d = d;
 		n->proxy = proxy;
+		n->muted = true; /* don't show "live" before the mute state is known */
 		g_hash_table_insert(d->nodes, GUINT_TO_POINTER(id), n);
 		pw_node_add_listener(proxy, &n->listener, &node_events, n);
+	} else if (spa_streq(type, PW_TYPE_INTERFACE_Device)) {
+		void *proxy = pw_registry_bind(d->registry, id, type,
+					       PW_VERSION_DEVICE, 0);
+		if (!proxy)
+			return;
+		struct device *dev = g_new0(struct device, 1);
+		dev->d = d;
+		dev->proxy = proxy;
+		g_hash_table_insert(d->devices, GUINT_TO_POINTER(id), dev);
+		pw_device_add_listener(proxy, &dev->listener, &device_events, dev);
 	} else if (spa_streq(type, PW_TYPE_INTERFACE_Link)) {
 		void *proxy = pw_registry_bind(d->registry, id, type,
 					       PW_VERSION_LINK, 0);
@@ -295,6 +379,13 @@ static void on_global_remove(void *_d, uint32_t id)
 		recompute(d);
 		return;
 	}
+	struct device *dev = g_hash_table_lookup(d->devices, GUINT_TO_POINTER(id));
+	if (dev) {
+		pw_proxy_destroy((struct pw_proxy *)dev->proxy);
+		g_hash_table_remove(d->devices, GUINT_TO_POINTER(id));
+		recompute(d);
+		return;
+	}
 	for (guint i = 0; i < d->links->len; i++) {
 		struct link *l = d->links->pdata[i];
 		if (l->id == id) {
@@ -318,6 +409,7 @@ static void do_reconnect(void *_d);
 static void clear_store(struct data *d)
 {
 	g_hash_table_remove_all(d->nodes);
+	g_hash_table_remove_all(d->devices);
 	while (d->links->len)
 		g_ptr_array_remove_index(d->links, d->links->len - 1);
 	g_clear_pointer(&d->default_source, g_free);
@@ -385,6 +477,8 @@ static void start_pw(struct data *d)
 	pw_init(NULL, NULL);
 	d->nodes = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL,
 					 (GDestroyNotify)node_free);
+	d->devices = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL,
+					   (GDestroyNotify)g_free);
 	d->links = g_ptr_array_new_with_free_func(g_free);
 
 	d->loop = pw_thread_loop_new("mic-indicator-pw", NULL);
